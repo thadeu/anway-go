@@ -23,7 +23,7 @@ if err != nil {
 return client.Push(ctx, job)
 ```
 
-A blank URL uses `SERVER_URL`. Use `tcp+tls://` for TLS. A client is safe for concurrent use.
+A blank URL uses `ANWAY_URL`. Use `tcp+tls://` for TLS. A client is safe for concurrent use.
 
 ## Worker
 

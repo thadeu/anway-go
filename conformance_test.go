@@ -124,7 +124,7 @@ func newJob(t *testing.T, jobType string, args ...any) *Job {
 func TestC01ConnectWithURLAndEnv(t *testing.T) {
 	server := startServer(t)
 
-	t.Setenv("SERVER_URL", server.url())
+	t.Setenv("ANWAY_URL", server.url())
 
 	if _, err := open(t, "").Info(context.Background()); err != nil {
 		t.Fatal(err)

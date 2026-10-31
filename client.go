@@ -45,11 +45,11 @@ type Client struct {
 	once    sync.Once
 }
 
-// Open creates a client. A blank URL uses SERVER_URL, then the local default.
+// Open creates a client. A blank URL uses ANWAY_URL, then the local default.
 // The connections open at first use.
 func Open(serverURL string, options Options) (*Client, error) {
 	if serverURL == "" {
-		serverURL = os.Getenv("SERVER_URL")
+		serverURL = os.Getenv("ANWAY_URL")
 	}
 
 	if serverURL == "" {

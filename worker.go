@@ -49,7 +49,7 @@ type Worker struct {
 	middleware []Middleware
 }
 
-// NewWorker creates a worker. A blank URL uses SERVER_URL.
+// NewWorker creates a worker. A blank URL uses ANWAY_URL.
 func NewWorker(serverURL string, options WorkerOptions) *Worker {
 	if len(options.Queues) == 0 {
 		options.Queues = []string{"default"}
