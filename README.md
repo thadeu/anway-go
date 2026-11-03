@@ -64,6 +64,41 @@ The worker stops at the server `terminate` command, or when its context ends. Se
 
 Handlers must respect `ctx`. A goroutine that ignores it continues to run after `Run` returns.
 
+## Topics
+
+A topic sends one event to many queues. `Publish` makes one job for each subscription of the topic, in one transaction. Each copy is a normal job in the queue of its subscriber, with its own retries.
+
+Publish one `chat.message` event:
+
+```go
+published, err := client.Publish(ctx, "chat.message", []any{map[string]any{"room": "general", "body": "hi"}}, anway.PublishOptions{ID: "msg-42"})
+if err != nil {
+	return err
+}
+
+// published.Jobs is 3: one job in each of the realtime, cassandra, and push queues.
+```
+
+Each app declares its subscription in its worker, with its own queue and job type. In this short example, one worker has all three:
+
+```go
+worker := anway.NewWorker("", anway.WorkerOptions{})
+retries := 5
+
+worker.Subscribe(anway.Subscription{Topic: "chat.message", Queue: "realtime", JobType: "chat.broadcast"}, broadcast)
+worker.Subscribe(anway.Subscription{Topic: "chat.message", Queue: "cassandra", JobType: "chat.store"}, store)
+worker.Subscribe(anway.Subscription{Topic: "chat.message", Queue: "push", JobType: "chat.notify", Retry: &retries}, notify)
+
+return worker.Run(ctx)
+```
+
+`Run` sends `SUBSCRIBE` for each subscription before its first fetch. The worker fetches from the queue of each subscription. Without `Queues`, it fetches only from these queues.
+
+- With an `ID`, a second event with the same topic and id within `UniqueFor` (one day) does nothing, and `Duplicate` is true. A zero `UniqueFor` turns this check off.
+- `Custom` goes to each copy. The server adds `topic` and `event` to it. Use `job.Custom["event"]` to make a handler idempotent.
+- An event with no subscription goes to the Dead set, and `Jobs` is 0.
+- `Retry` and `ReserveFor` in a `Subscription` set the options of each copy. `Worker.Subscribe` sends them at each start, so the worker code sets them. `client.Subscribe` and `client.Unsubscribe` change subscriptions from any app.
+
 ## Contract
 
 | Group | Operations |
@@ -73,7 +108,8 @@ Handlers must respect `ctx`. A goroutine that ignores it continues to run after 
 | Admin | `Mutate` |
 | Batches | `BatchNew`, `BatchOpen`, `BatchCommit`, `BatchStatus` |
 | Tracking | `TrackGet`, `TrackSet` |
-| Worker | `Register`, `Use`, `Run` |
+| Topics | `Publish`, `Subscribe`, `Unsubscribe` |
+| Worker | `Register`, `Subscribe`, `Use`, `Run` |
 
 The error kinds are `ErrNotUnique`, `ErrClosed`, `ServerError`, and connection errors. A failed call does not resend, so the app decides whether to repeat it.
 

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"runtime/debug"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -43,17 +44,18 @@ type WorkerOptions struct {
 
 // Worker fetches and runs jobs.
 type Worker struct {
-	url        string
-	options    WorkerOptions
-	handlers   map[string]Handler
-	middleware []Middleware
+	url           string
+	options       WorkerOptions
+	handlers      map[string]Handler
+	middleware    []Middleware
+	subscriptions []Subscription
 }
 
-// NewWorker creates a worker. A blank URL uses ANWAY_URL.
+// NewWorker creates a worker. A blank URL uses ANWAY_URL. Without queues, the
+// worker fetches from the queues of its subscriptions, or from "default" when
+// it has no subscription.
 func NewWorker(serverURL string, options WorkerOptions) *Worker {
-	if len(options.Queues) == 0 {
-		options.Queues = []string{"default"}
-	}
+	options.Queues = slices.Clone(options.Queues)
 
 	if options.Concurrency <= 0 {
 		options.Concurrency = defaultConcurrency
@@ -83,6 +85,21 @@ func (w *Worker) Register(jobType string, handler Handler) {
 	w.handlers[jobType] = handler
 }
 
+// Subscribe connects the job type of a subscription to a handler, and
+// subscribes it to its topic. The worker fetches from the queue, and sends
+// SUBSCRIBE when Run starts, before its first FETCH. Retry and ReserveFor are
+// the options of each copy. Each start sends them again, so the code of the
+// worker sets them, as in the Ruby and JS clients.
+func (w *Worker) Subscribe(subscription Subscription, handler Handler) {
+	w.Register(subscription.JobType, handler)
+
+	w.subscriptions = append(w.subscriptions, subscription)
+
+	if !slices.Contains(w.options.Queues, subscription.Queue) {
+		w.options.Queues = append(w.options.Queues, subscription.Queue)
+	}
+}
+
 // Use adds middleware. The first one added is the outermost.
 func (w *Worker) Use(middleware ...Middleware) {
 	w.middleware = append(w.middleware, middleware...)
@@ -91,6 +108,7 @@ func (w *Worker) Use(middleware ...Middleware) {
 // session is the state of one Run call.
 type session struct {
 	client     *Client
+	queues     []string
 	jobCtx     context.Context
 	cancelJobs context.CancelFunc
 	stop       chan struct{}
@@ -181,11 +199,22 @@ func (w *Worker) Run(ctx context.Context) error {
 		return err
 	}
 
+	if err := w.subscribe(ctx, client); err != nil && ctx.Err() == nil {
+		return err
+	}
+
+	queues := w.options.Queues
+
+	if len(queues) == 0 {
+		queues = []string{"default"}
+	}
+
 	jobCtx, cancelJobs := context.WithCancel(context.Background())
 	defer cancelJobs()
 
 	current := &session{
 		client:     client,
+		queues:     queues,
 		jobCtx:     jobCtx,
 		cancelJobs: cancelJobs,
 		stop:       make(chan struct{}),
@@ -237,6 +266,18 @@ func (w *Worker) Run(ctx context.Context) error {
 	}
 }
 
+// subscribe sends SUBSCRIBE for each subscription of the worker. The server
+// keeps one subscription for the same topic, queue, and job type.
+func (w *Worker) subscribe(ctx context.Context, client *Client) error {
+	for _, subscription := range w.subscriptions {
+		if err := client.Subscribe(ctx, subscription); err != nil {
+			return fmt.Errorf("subscribe %s to %s: %w", subscription.JobType, subscription.Topic, err)
+		}
+	}
+
+	return nil
+}
+
 func (w *Worker) shutdown(current *session) {
 	current.stopFetching()
 
@@ -279,7 +320,7 @@ func (w *Worker) fetchLoop(current *session) {
 	for !current.stopped() {
 		started := time.Now()
 
-		job, err := current.client.Fetch(context.Background(), w.options.Queues...)
+		job, err := current.client.Fetch(context.Background(), current.queues...)
 		if err != nil {
 			w.options.Logger.Warn("fetch failed", "error", err)
 			current.pause(errorPause)

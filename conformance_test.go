@@ -5,15 +5,18 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -531,6 +534,19 @@ func waitFor(t *testing.T, check func() bool) {
 func retries(t *testing.T, client *Client) float64 {
 	t.Helper()
 
+	return taskSize(t, client, "Retries")
+}
+
+func dead(t *testing.T, client *Client) float64 {
+	t.Helper()
+
+	return taskSize(t, client, "Dead")
+}
+
+// taskSize reads the size of a job set, such as "Retries" or "Dead".
+func taskSize(t *testing.T, client *Client, name string) float64 {
+	t.Helper()
+
 	info, err := client.Info(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -538,7 +554,7 @@ func retries(t *testing.T, client *Client) float64 {
 
 	tasks := info["faktory"].(map[string]any)["tasks"].(map[string]any)
 
-	return tasks["Retries"].(map[string]any)["size"].(float64)
+	return tasks[name].(map[string]any)["size"].(float64)
 }
 
 func processed(t *testing.T, client *Client) float64 {
@@ -628,9 +644,8 @@ func ctxOrder(ctx context.Context) string {
 }
 
 func TestW06ServerTerminateFailsUnfinishedJobs(t *testing.T) {
-	server := startServer(t)
-	client := open(t, server.url())
-	worker := NewWorker(server.url(), WorkerOptions{
+	script := &scriptedServer{job: `{"jid":"slow-1","jobtype":"slow","args":[],"queue":"default"}`}
+	worker := NewWorker(script.start(t), WorkerOptions{
 		Concurrency:     1,
 		BeatInterval:    20 * time.Millisecond,
 		ShutdownTimeout: 50 * time.Millisecond,
@@ -647,52 +662,16 @@ func TestW06ServerTerminateFailsUnfinishedJobs(t *testing.T) {
 
 	_, done := runWorker(t, worker)
 
-	if err := client.Push(context.Background(), newJob(t, "slow")); err != nil {
-		t.Fatal(err)
-	}
-
 	<-started
-
-	if err := server.cmd.Process.Signal(os.Interrupt); err != nil {
-		t.Fatal(err)
-	}
+	script.terminate.Store(true)
 
 	waitDone(t, done)
 
-	server.stop()
-	server.start(t)
+	failures := script.failures()
 
-	failure := requeuedFailure(t, server)
-	if !strings.Contains(failure.Message, "context canceled") {
-		t.Fatalf("unexpected failure: %+v", failure)
+	if len(failures) != 1 || failures[0].JID != "slow-1" || !strings.Contains(failures[0].Message, "context canceled") {
+		t.Fatalf("the worker must FAIL the unfinished job: %+v", failures)
 	}
-}
-
-// requeuedFailure reads the failure of the one job in retries.
-func requeuedFailure(t *testing.T, server *testServer) *Failure {
-	t.Helper()
-
-	client := open(t, server.url())
-	ctx := context.Background()
-
-	if count := retries(t, client); count != 1 {
-		t.Fatalf("unexpected retries: %v", count)
-	}
-
-	if err := client.Mutate(ctx, "requeue", "retries", Filter{}); err != nil {
-		t.Fatal(err)
-	}
-
-	job, err := client.Fetch(ctx, "default")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if job == nil || job.Failure == nil {
-		t.Fatalf("unexpected job: %+v", job)
-	}
-
-	return job.Failure
 }
 
 func waitDone(t *testing.T, done <-chan error) {
@@ -742,13 +721,55 @@ func TestW07LocalStopLetsJobsFinish(t *testing.T) {
 	}
 }
 
-// scriptedServer replies quiet to beats 2 to 20, and then terminate.
+// scriptedServer acts as a server for a worker. BEAT replies quiet for beats
+// 2 to lastQuiet, and terminate after lastQuiet or after terminate is set.
+// The first FETCH gives out job, when it is set. FAIL reports are recorded.
 type scriptedServer struct {
+	job       string
+	lastQuiet int64
+
 	beats        atomic.Int64
 	quietFetches atomic.Int64
+	jobSent      atomic.Bool
+	terminate    atomic.Bool
+
+	mu     sync.Mutex
+	failed []failReport
+}
+
+// failReport is the argument of a FAIL command.
+type failReport struct {
+	JID     string `json:"jid"`
+	ErrType string `json:"errtype"`
+	Message string `json:"message"`
 }
 
 const lastQuietBeat = 20
+
+// start accepts connections until the test ends, and returns the server URL.
+func (s *scriptedServer) start(t *testing.T) string {
+	t.Helper()
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(func() { listener.Close() })
+
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+
+			go s.serve(conn)
+		}
+	}()
+
+	return "tcp://" + listener.Addr().String()
+}
 
 func (s *scriptedServer) serve(conn net.Conn) {
 	defer conn.Close()
@@ -758,61 +779,73 @@ func (s *scriptedServer) serve(conn net.Conn) {
 	lines := bufio.NewScanner(conn)
 
 	for lines.Scan() {
-		verb, _, _ := strings.Cut(lines.Text(), " ")
+		verb, argument, _ := strings.Cut(lines.Text(), " ")
 
 		switch verb {
 		case "FETCH":
-			if s.beats.Load() > 1 {
-				s.quietFetches.Add(1)
-			}
-
-			time.Sleep(5 * time.Millisecond)
-			io.WriteString(conn, "$-1\r\n")
+			io.WriteString(conn, s.fetchReply())
 		case "BEAT":
 			io.WriteString(conn, s.beatReply(s.beats.Add(1)))
+		case "FAIL":
+			s.recordFail(argument)
+			io.WriteString(conn, "+OK\r\n")
 		default:
 			io.WriteString(conn, "+OK\r\n")
 		}
 	}
 }
 
+func (s *scriptedServer) fetchReply() string {
+	if s.job != "" && s.jobSent.CompareAndSwap(false, true) {
+		return bulkReply(s.job)
+	}
+
+	if s.beats.Load() > 1 {
+		s.quietFetches.Add(1)
+	}
+
+	time.Sleep(5 * time.Millisecond)
+
+	return "$-1\r\n"
+}
+
 func (s *scriptedServer) beatReply(count int64) string {
-	state := "quiet"
-
-	if count == 1 {
-		return "+OK\r\n"
+	if s.terminate.Load() || (s.lastQuiet > 0 && count > s.lastQuiet) {
+		return bulkReply(`{"state":"terminate"}`)
 	}
 
-	if count > lastQuietBeat {
-		state = "terminate"
+	if count > 1 && count <= s.lastQuiet {
+		return bulkReply(`{"state":"quiet"}`)
 	}
 
-	body := fmt.Sprintf(`{"state":%q}`, state)
+	return "+OK\r\n"
+}
 
+func (s *scriptedServer) recordFail(argument string) {
+	var report failReport
+
+	json.Unmarshal([]byte(argument), &report)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.failed = append(s.failed, report)
+}
+
+func (s *scriptedServer) failures() []failReport {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return slices.Clone(s.failed)
+}
+
+func bulkReply(body string) string {
 	return fmt.Sprintf("$%d\r\n%s\r\n", len(body), body)
 }
 
 func TestW08QuietKeepsWorkerAlive(t *testing.T) {
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer listener.Close()
-
-	script := &scriptedServer{}
-
-	go func() {
-		for {
-			conn, err := listener.Accept()
-			if err != nil {
-				return
-			}
-
-			go script.serve(conn)
-		}
-	}()
-
-	worker := NewWorker("tcp://"+listener.Addr().String(), WorkerOptions{
+	script := &scriptedServer{lastQuiet: lastQuietBeat}
+	worker := NewWorker(script.start(t), WorkerOptions{
 		Concurrency:  1,
 		BeatInterval: 50 * time.Millisecond,
 	})
@@ -899,5 +932,218 @@ func TestW10HandlerThatIgnoresContextCannotBlockShutdown(t *testing.T) {
 
 	if count := processed(t, client); count != 0 {
 		t.Fatalf("a late return must not ack: %v", count)
+	}
+}
+
+const chatTopic = "chat.message"
+
+func subscribe(t *testing.T, client *Client, queue, jobType string) {
+	t.Helper()
+
+	subscription := Subscription{Topic: chatTopic, Queue: queue, JobType: jobType}
+
+	if err := client.Subscribe(context.Background(), subscription); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func publish(t *testing.T, client *Client, options PublishOptions, args ...any) Published {
+	t.Helper()
+
+	published, err := client.Publish(context.Background(), chatTopic, args, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return published
+}
+
+// waitSubscribed publishes probe events until one makes the given number of
+// jobs. Handlers see the probes, and ignore them.
+func waitSubscribed(t *testing.T, client *Client, jobs int) {
+	t.Helper()
+
+	waitFor(t, func() bool { return publish(t, client, PublishOptions{}).Jobs == jobs })
+}
+
+// eventLog records the events that a handler runs.
+type eventLog struct {
+	mu     sync.Mutex
+	counts map[string]int
+}
+
+func (l *eventLog) handler(prefix string) Handler {
+	return func(_ context.Context, job *Job) error {
+		event, _ := job.Custom["event"].(string)
+
+		if !strings.HasPrefix(event, prefix) {
+			return nil
+		}
+
+		l.mu.Lock()
+		defer l.mu.Unlock()
+
+		l.counts[event]++
+
+		return nil
+	}
+}
+
+func (l *eventLog) snapshot() map[string]int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	return maps.Clone(l.counts)
+}
+
+func TestT01PublishMakesOneJobForEachSubscription(t *testing.T) {
+	client := open(t, startServer(t).url())
+	ctx := context.Background()
+
+	subscribers := map[string]string{"realtime": "chat.broadcast", "cassandra": "chat.store", "push": "chat.notify"}
+
+	for queue, jobType := range subscribers {
+		subscribe(t, client, queue, jobType)
+	}
+
+	options := PublishOptions{ID: "msg-42", Custom: map[string]any{"tenant": "acme"}}
+	published := publish(t, client, options, map[string]any{"room": "general", "body": "hi"})
+
+	if published != (Published{Event: "msg-42", Jobs: 3}) {
+		t.Fatalf("unexpected result: %+v", published)
+	}
+
+	for queue, jobType := range subscribers {
+		job, err := client.Fetch(ctx, queue)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if job == nil || job.Type != jobType || job.Queue != queue {
+			t.Fatalf("unexpected job in %s: %+v", queue, job)
+		}
+
+		if job.Custom["topic"] != chatTopic || job.Custom["event"] != "msg-42" || job.Custom["tenant"] != "acme" {
+			t.Fatalf("unexpected custom in %s: %v", queue, job.Custom)
+		}
+
+		var message map[string]string
+
+		if err := job.Bind(&message); err != nil {
+			t.Fatal(err)
+		}
+
+		if message["body"] != "hi" {
+			t.Fatalf("unexpected args in %s: %s", queue, job.Args)
+		}
+	}
+}
+
+func TestT02SubscribeIsIdempotent(t *testing.T) {
+	client := open(t, startServer(t).url())
+	ctx := context.Background()
+
+	subscribe(t, client, "push", "chat.notify")
+	subscribe(t, client, "push", "chat.notify")
+
+	if published := publish(t, client, PublishOptions{}); published.Jobs != 1 {
+		t.Fatalf("two subscribes must keep one subscription: %+v", published)
+	}
+
+	for range 2 {
+		if err := client.Unsubscribe(ctx, chatTopic, "push", "chat.notify"); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if published := publish(t, client, PublishOptions{}); published.Jobs != 0 {
+		t.Fatalf("unsubscribe must remove the subscription: %+v", published)
+	}
+}
+
+func TestT03DuplicateEvent(t *testing.T) {
+	client := open(t, startServer(t).url())
+	ctx := context.Background()
+
+	subscribe(t, client, "push", "chat.notify")
+
+	first := publish(t, client, PublishOptions{ID: "msg-1"})
+	second := publish(t, client, PublishOptions{ID: "msg-1"})
+
+	if first != (Published{Event: "msg-1", Jobs: 1}) || second != (Published{Event: "msg-1", Duplicate: true}) {
+		t.Fatalf("a second publish of msg-1 must be a duplicate: %+v %+v", first, second)
+	}
+
+	noDedup := time.Duration(0)
+
+	for range 2 {
+		if published := publish(t, client, PublishOptions{ID: "msg-2", UniqueFor: &noDedup}); published.Jobs != 1 {
+			t.Fatalf("a zero UniqueFor must turn the check off: %+v", published)
+		}
+	}
+
+	if sizes, err := client.QueueSizes(ctx); err != nil || sizes["push"] != 3 {
+		t.Fatalf("unexpected sizes: %v %v", sizes, err)
+	}
+}
+
+func TestT04EventWithNoSubscriptionGoesToDead(t *testing.T) {
+	client := open(t, startServer(t).url())
+
+	published := publish(t, client, PublishOptions{}, "hi")
+
+	if published.Jobs != 0 || published.Duplicate || !strings.HasPrefix(published.Event, "evt-") {
+		t.Fatalf("unexpected result: %+v", published)
+	}
+
+	if count := dead(t, client); count != 1 {
+		t.Fatalf("unexpected dead: %v", count)
+	}
+}
+
+func TestT05WorkerSubscribesWhenItStarts(t *testing.T) {
+	server := startServer(t)
+	client := open(t, server.url())
+	worker := NewWorker(server.url(), WorkerOptions{Concurrency: 1})
+	log := &eventLog{counts: map[string]int{}}
+
+	worker.Subscribe(Subscription{Topic: chatTopic, Queue: "realtime", JobType: "chat.broadcast"}, log.handler("msg-"))
+	runWorker(t, worker)
+
+	waitSubscribed(t, client, 1)
+	publish(t, client, PublishOptions{ID: "msg-1"}, "hi")
+
+	waitFor(t, func() bool { return log.snapshot()["msg-1"] == 1 })
+}
+
+func TestT06TwoWorkersRunOneCopyOfEachEvent(t *testing.T) {
+	server := startServer(t)
+	client := open(t, server.url())
+	logs := map[string]*eventLog{}
+
+	for queue, jobType := range map[string]string{"cassandra": "chat.store", "push": "chat.notify"} {
+		worker := NewWorker(server.url(), WorkerOptions{Concurrency: 2})
+		logs[queue] = &eventLog{counts: map[string]int{}}
+
+		worker.Subscribe(Subscription{Topic: chatTopic, Queue: queue, JobType: jobType}, logs[queue].handler("msg-"))
+		runWorker(t, worker)
+	}
+
+	waitSubscribed(t, client, 2)
+
+	events := []string{"msg-1", "msg-2", "msg-3"}
+
+	for _, event := range events {
+		publish(t, client, PublishOptions{ID: event}, event)
+	}
+
+	for queue, log := range logs {
+		waitFor(t, func() bool { return len(log.snapshot()) == len(events) })
+
+		for event, count := range log.snapshot() {
+			if !slices.Contains(events, event) || count != 1 {
+				t.Fatalf("%s ran %s %d times", queue, event, count)
+			}
+		}
 	}
 }
