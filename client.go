@@ -21,8 +21,8 @@ const (
 	fetchWait      = 2 * time.Second
 )
 
-// Options changes how a client connects. All fields are optional.
-type Options struct {
+// ClientOptions changes how a client connects. All fields are optional.
+type ClientOptions struct {
 	PoolSize int
 	Timeout  time.Duration
 	TLS      *tls.Config
@@ -39,7 +39,7 @@ type endpoint struct {
 // Client talks to the server. It is safe for concurrent use.
 type Client struct {
 	target  endpoint
-	options Options
+	options ClientOptions
 	slots   chan *conn
 	closed  chan struct{}
 	once    sync.Once
@@ -47,7 +47,7 @@ type Client struct {
 
 // Open creates a client. A blank URL uses ANWAY_URL, then the local default.
 // The connections open at first use.
-func Open(serverURL string, options Options) (*Client, error) {
+func Open(serverURL string, options ClientOptions) (*Client, error) {
 	if serverURL == "" {
 		serverURL = os.Getenv("ANWAY_URL")
 	}
@@ -280,9 +280,9 @@ func (c *Client) queue(ctx context.Context, action string, queues []string) erro
 
 // Filter selects jobs for Mutate. Blank fields match all jobs.
 type Filter struct {
-	JobType string   `json:"jobtype,omitempty"`
-	JIDs    []string `json:"jids,omitempty"`
-	Regexp  string   `json:"regexp,omitempty"`
+	Event  string   `json:"jobtype,omitempty"`
+	JIDs   []string `json:"jids,omitempty"`
+	Regexp string   `json:"regexp,omitempty"`
 }
 
 // Mutate changes jobs in "retries", "scheduled", or "dead".

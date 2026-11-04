@@ -29,12 +29,13 @@ type PublishOptions struct {
 	Custom    map[string]any
 }
 
-// Subscription sends the events of a topic to a queue as jobs of a job type.
-// Retry and ReserveFor are the options of each copy, as in a job.
+// Subscription sends the events of a topic to a queue as jobs of an event.
+// The event goes out as the job type. Retry and ReserveFor (in seconds) are
+// the options of each copy, as in a job.
 type Subscription struct {
 	Topic      string `json:"topic"`
 	Queue      string `json:"queue"`
-	JobType    string `json:"jobtype"`
+	Event      string `json:"jobtype"`
 	Retry      *int   `json:"retry,omitempty"`
 	ReserveFor int    `json:"reserve_for,omitempty"`
 }
@@ -68,7 +69,7 @@ func (c *Client) Publish(ctx context.Context, topic string, args []any, options 
 }
 
 // Subscribe saves a subscription on the server. It is idempotent: a second
-// call with the same topic, queue, and job type sets the new options.
+// call with the same topic, queue, and event sets the new options.
 func (c *Client) Subscribe(ctx context.Context, subscription Subscription) error {
 	_, err := c.call(ctx, "SUBSCRIBE", subscription, 0)
 
@@ -76,8 +77,9 @@ func (c *Client) Subscribe(ctx context.Context, subscription Subscription) error
 }
 
 // Unsubscribe removes a subscription. A missing subscription is not an error.
-func (c *Client) Unsubscribe(ctx context.Context, topic, queue, jobType string) error {
-	subscription := Subscription{Topic: topic, Queue: queue, JobType: jobType}
+func (c *Client) Unsubscribe(ctx context.Context, topic, queue, event string) error {
+	subscription := Subscription{Topic: topic, Queue: queue, Event: event}
+
 	_, err := c.call(ctx, "UNSUBSCRIBE", subscription, 0)
 
 	return err

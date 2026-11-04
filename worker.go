@@ -39,7 +39,7 @@ type WorkerOptions struct {
 	Labels          []string
 	BeatInterval    time.Duration
 	Logger          *slog.Logger
-	Client          Options
+	Client          ClientOptions
 }
 
 // Worker fetches and runs jobs.
@@ -51,9 +51,9 @@ type Worker struct {
 	subscriptions []Subscription
 }
 
-// NewWorker creates a worker. A blank URL uses ANWAY_URL. Without queues, the
-// worker fetches from the queues of its subscriptions, or from "default" when
-// it has no subscription.
+// NewWorker creates a worker. A blank URL uses ANWAY_URL. The worker fetches
+// from Queues and from the queues that On adds. Without any queue, it fetches
+// from "default".
 func NewWorker(serverURL string, options WorkerOptions) *Worker {
 	options.Queues = slices.Clone(options.Queues)
 
@@ -80,23 +80,44 @@ func NewWorker(serverURL string, options WorkerOptions) *Worker {
 	return &Worker{url: serverURL, options: options, handlers: map[string]Handler{}}
 }
 
-// Register connects a job type to a handler.
-func (w *Worker) Register(jobType string, handler Handler) {
-	w.handlers[jobType] = handler
-}
+// On declares the handler of an event. The worker runs jobs whose job type
+// is the event. The option sets merge in order, as Options describes.
+//
+// A declaration uses only Queue, Retry, ReserveFor, and Topics. For each
+// topic, the worker records one subscription with the event as the job type
+// and the merged queue, retry, and reserve_for, and Run sends SUBSCRIBE for it
+// before its first FETCH. Each start sends them again, so the code of the
+// worker sets them, as in the Ruby and JS clients. When the declaration has
+// topics or sets a queue, the worker also fetches from that queue. At,
+// Backtrace, UniqueFor, UniqueUntil, ExpiresIn, ExpiresAt, Track, OnDead, and
+// Custom are push keys, and they have no effect here.
+//
+// A worker has one handler for each event. On panics when the event already
+// has a handler. To send one topic to several flows, declare several events,
+// each with the topic.
+func (w *Worker) On(event string, handler Handler, options ...Options) {
+	if _, taken := w.handlers[event]; taken {
+		panic(fmt.Sprintf("anway: multiple handlers for event %q", event))
+	}
 
-// Subscribe connects the job type of a subscription to a handler, and
-// subscribes it to its topic. The worker fetches from the queue, and sends
-// SUBSCRIBE when Run starts, before its first FETCH. Retry and ReserveFor are
-// the options of each copy. Each start sends them again, so the code of the
-// worker sets them, as in the Ruby and JS clients.
-func (w *Worker) Subscribe(subscription Subscription, handler Handler) {
-	w.Register(subscription.JobType, handler)
+	declaration, topics := translate(event, options)
 
-	w.subscriptions = append(w.subscriptions, subscription)
+	w.handlers[event] = handler
 
-	if !slices.Contains(w.options.Queues, subscription.Queue) {
-		w.options.Queues = append(w.options.Queues, subscription.Queue)
+	for _, topic := range topics {
+		w.subscriptions = append(w.subscriptions, Subscription{
+			Topic:      topic,
+			Queue:      declaration.Queue,
+			Event:      event,
+			Retry:      declaration.Retry,
+			ReserveFor: declaration.ReserveFor,
+		})
+	}
+
+	fetches := len(topics) > 0 || slices.ContainsFunc(options, func(set Options) bool { return set.Queue != "" })
+
+	if fetches && !slices.Contains(w.options.Queues, declaration.Queue) {
+		w.options.Queues = append(w.options.Queues, declaration.Queue)
 	}
 }
 
@@ -206,7 +227,7 @@ func (w *Worker) Run(ctx context.Context) error {
 	queues := w.options.Queues
 
 	if len(queues) == 0 {
-		queues = []string{"default"}
+		queues = []string{defaultQueue}
 	}
 
 	jobCtx, cancelJobs := context.WithCancel(context.Background())
@@ -267,11 +288,11 @@ func (w *Worker) Run(ctx context.Context) error {
 }
 
 // subscribe sends SUBSCRIBE for each subscription of the worker. The server
-// keeps one subscription for the same topic, queue, and job type.
+// keeps one subscription for the same topic, queue, and event.
 func (w *Worker) subscribe(ctx context.Context, client *Client) error {
 	for _, subscription := range w.subscriptions {
 		if err := client.Subscribe(ctx, subscription); err != nil {
-			return fmt.Errorf("subscribe %s to %s: %w", subscription.JobType, subscription.Topic, err)
+			return fmt.Errorf("subscribe %s to %s: %w", subscription.Event, subscription.Topic, err)
 		}
 	}
 

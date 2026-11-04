@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -103,7 +104,7 @@ func (s *testServer) url() string {
 func open(t *testing.T, serverURL string) *Client {
 	t.Helper()
 
-	client, err := Open(serverURL, Options{WID: fmt.Sprintf("test-%d", time.Now().UnixNano())})
+	client, err := Open(serverURL, ClientOptions{WID: fmt.Sprintf("test-%d", time.Now().UnixNano())})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -113,10 +114,10 @@ func open(t *testing.T, serverURL string) *Client {
 	return client
 }
 
-func newJob(t *testing.T, jobType string, args ...any) *Job {
+func newJob(t *testing.T, event string, args []any, options ...Options) *Job {
 	t.Helper()
 
-	job, err := NewJob(jobType, args...)
+	job, err := NewJob(event, args, options...)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -177,7 +178,7 @@ func TestC03TLS(t *testing.T) {
 
 	roots.AddCert(parsed)
 
-	options := Options{TLS: &tls.Config{RootCAs: roots, ServerName: "example.com"}}
+	options := ClientOptions{TLS: &tls.Config{RootCAs: roots, ServerName: "example.com"}}
 
 	client, err := Open("tcp+tls://"+server.addr, options)
 	if err != nil {
@@ -202,7 +203,7 @@ func TestC04PushFetchAck(t *testing.T) {
 	client := open(t, startServer(t).url())
 	ctx := context.Background()
 
-	if err := client.Push(ctx, newJob(t, "email", "a@b.com", 42)); err != nil {
+	if err := client.Push(ctx, newJob(t, "email", []any{"a@b.com", 42})); err != nil {
 		t.Fatal(err)
 	}
 
@@ -239,7 +240,7 @@ func TestC05EmptyFetch(t *testing.T) {
 func TestC06Fail(t *testing.T) {
 	client := open(t, startServer(t).url())
 	ctx := context.Background()
-	pushed := newJob(t, "x")
+	pushed := newJob(t, "x", nil)
 
 	if err := client.Push(ctx, pushed); err != nil {
 		t.Fatal(err)
@@ -271,11 +272,11 @@ func TestC07NotUnique(t *testing.T) {
 	client := open(t, startServer(t).url())
 	ctx := context.Background()
 
-	if err := client.Push(ctx, newJob(t, "x", 1).SetCustom("unique_for", 60)); err != nil {
+	if err := client.Push(ctx, newJob(t, "x", []any{1}, Options{UniqueFor: time.Minute})); err != nil {
 		t.Fatal(err)
 	}
 
-	err := client.Push(ctx, newJob(t, "x", 1).SetCustom("unique_for", 60))
+	err := client.Push(ctx, newJob(t, "x", []any{1}, Options{UniqueFor: time.Minute}))
 	if !errors.Is(err, ErrNotUnique) {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -285,7 +286,7 @@ func TestC08Scheduled(t *testing.T) {
 	client := open(t, startServer(t).url())
 	ctx := context.Background()
 
-	if err := client.Push(ctx, newJob(t, "x").RunAt(time.Now().Add(time.Hour))); err != nil {
+	if err := client.Push(ctx, newJob(t, "x", nil, Options{At: time.Now().Add(time.Hour)})); err != nil {
 		t.Fatal(err)
 	}
 
@@ -298,7 +299,7 @@ func TestC09PauseResume(t *testing.T) {
 	client := open(t, startServer(t).url())
 	ctx := context.Background()
 
-	if err := client.Push(ctx, newJob(t, "x")); err != nil {
+	if err := client.Push(ctx, newJob(t, "x", nil)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -324,7 +325,7 @@ func TestC10MutateRequeue(t *testing.T) {
 	ctx := context.Background()
 
 	for _, kind := range []string{"a", "b"} {
-		pushed := newJob(t, kind)
+		pushed := newJob(t, kind, nil)
 
 		if err := client.Push(ctx, pushed); err != nil {
 			t.Fatal(err)
@@ -339,7 +340,7 @@ func TestC10MutateRequeue(t *testing.T) {
 		}
 	}
 
-	if err := client.Mutate(ctx, "requeue", "retries", Filter{JobType: "a"}); err != nil {
+	if err := client.Mutate(ctx, "requeue", "retries", Filter{Event: "a"}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -361,12 +362,12 @@ func TestC11Batch(t *testing.T) {
 	client := open(t, startServer(t).url())
 	ctx := context.Background()
 
-	bid, err := client.BatchNew(ctx, Batch{Success: newJob(t, "on-success"), Complete: newJob(t, "on-complete")})
+	bid, err := client.BatchNew(ctx, Batch{Success: newJob(t, "on-success", nil), Complete: newJob(t, "on-complete", nil)})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if err := client.Push(ctx, newJob(t, "member").SetCustom("bid", bid)); err != nil {
+	if err := client.Push(ctx, newJob(t, "member", nil).SetCustom("bid", bid)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -402,7 +403,7 @@ func TestC11Batch(t *testing.T) {
 func TestC12Track(t *testing.T) {
 	client := open(t, startServer(t).url())
 	ctx := context.Background()
-	pushed := newJob(t, "x").SetCustom("track", 1)
+	pushed := newJob(t, "x", nil, Options{Track: true})
 
 	if err := client.Push(ctx, pushed); err != nil {
 		t.Fatal(err)
@@ -428,7 +429,7 @@ func TestC13Info(t *testing.T) {
 	client := open(t, startServer(t).url())
 	ctx := context.Background()
 
-	if err := client.Push(ctx, newJob(t, "x")); err != nil {
+	if err := client.Push(ctx, newJob(t, "x", nil)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -450,7 +451,7 @@ func TestC14ConcurrentCallers(t *testing.T) {
 
 	for range 100 {
 		group.Go(func() {
-			if err := client.Push(ctx, newJob(t, "x")); err != nil {
+			if err := client.Push(ctx, newJob(t, "x", nil)); err != nil {
 				t.Error(err)
 			}
 		})
@@ -470,7 +471,7 @@ func TestC16ClosedClient(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := client.Push(context.Background(), newJob(t, "x")); !errors.Is(err, ErrClosed) {
+	if err := client.Push(context.Background(), newJob(t, "x", nil)); !errors.Is(err, ErrClosed) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
@@ -480,7 +481,7 @@ func TestC15Reconnect(t *testing.T) {
 	client := open(t, server.url())
 	ctx := context.Background()
 
-	if err := client.Push(ctx, newJob(t, "x")); err != nil {
+	if err := client.Push(ctx, newJob(t, "x", nil)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -490,7 +491,7 @@ func TestC15Reconnect(t *testing.T) {
 	var err error
 
 	for range 3 {
-		if err = client.Push(ctx, newJob(t, "x")); err == nil {
+		if err = client.Push(ctx, newJob(t, "x", nil)); err == nil {
 			break
 		}
 	}
@@ -573,10 +574,10 @@ func TestW01RunsAndAcks(t *testing.T) {
 	client := open(t, server.url())
 	worker := NewWorker(server.url(), WorkerOptions{Concurrency: 2})
 
-	worker.Register("x", func(context.Context, *Job) error { return nil })
+	worker.On("x", func(context.Context, *Job) error { return nil })
 	runWorker(t, worker)
 
-	if err := client.Push(context.Background(), newJob(t, "x")); err != nil {
+	if err := client.Push(context.Background(), newJob(t, "x", nil)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -588,13 +589,13 @@ func TestW02W03W04FailureKinds(t *testing.T) {
 	client := open(t, server.url())
 	worker := NewWorker(server.url(), WorkerOptions{Concurrency: 1})
 
-	worker.Register("error", func(context.Context, *Job) error { return errors.New("failed") })
-	worker.Register("panic", func(context.Context, *Job) error { panic("boom") })
-	worker.Register("ok", func(context.Context, *Job) error { return nil })
+	worker.On("error", func(context.Context, *Job) error { return errors.New("failed") })
+	worker.On("panic", func(context.Context, *Job) error { panic("boom") })
+	worker.On("ok", func(context.Context, *Job) error { return nil })
 	runWorker(t, worker)
 
 	for _, kind := range []string{"error", "panic", "unknown", "ok"} {
-		if err := client.Push(context.Background(), newJob(t, kind)); err != nil {
+		if err := client.Push(context.Background(), newJob(t, kind, nil)); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -618,7 +619,7 @@ func TestW05MiddlewareOrder(t *testing.T) {
 
 	worker.Use(wrap("a"), wrap("b"))
 
-	worker.Register("x", func(ctx context.Context, _ *Job) error {
+	worker.On("x", func(ctx context.Context, _ *Job) error {
 		result <- ctx.Value(contextKey("b")).(string)
 
 		return nil
@@ -626,7 +627,7 @@ func TestW05MiddlewareOrder(t *testing.T) {
 
 	runWorker(t, worker)
 
-	if err := client.Push(context.Background(), newJob(t, "x")); err != nil {
+	if err := client.Push(context.Background(), newJob(t, "x", nil)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -653,7 +654,7 @@ func TestW06ServerTerminateFailsUnfinishedJobs(t *testing.T) {
 	})
 	started := make(chan struct{})
 
-	worker.Register("slow", func(ctx context.Context, _ *Job) error {
+	worker.On("slow", func(ctx context.Context, _ *Job) error {
 		close(started)
 		<-ctx.Done()
 
@@ -695,7 +696,7 @@ func TestW07LocalStopLetsJobsFinish(t *testing.T) {
 
 	var finished atomic.Bool
 
-	worker.Register("slow", func(context.Context, *Job) error {
+	worker.On("slow", func(context.Context, *Job) error {
 		close(started)
 		time.Sleep(300 * time.Millisecond)
 		finished.Store(true)
@@ -705,7 +706,7 @@ func TestW07LocalStopLetsJobsFinish(t *testing.T) {
 
 	cancel, done := runWorker(t, worker)
 
-	if err := client.Push(context.Background(), newJob(t, "slow")); err != nil {
+	if err := client.Push(context.Background(), newJob(t, "slow", nil)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -869,7 +870,7 @@ func TestW09ShutdownTimeoutCancelsJobs(t *testing.T) {
 	worker := NewWorker(server.url(), WorkerOptions{Concurrency: 1, ShutdownTimeout: 50 * time.Millisecond})
 	started := make(chan struct{})
 
-	worker.Register("slow", func(ctx context.Context, _ *Job) error {
+	worker.On("slow", func(ctx context.Context, _ *Job) error {
 		close(started)
 		<-ctx.Done()
 
@@ -878,7 +879,7 @@ func TestW09ShutdownTimeoutCancelsJobs(t *testing.T) {
 
 	cancel, done := runWorker(t, worker)
 
-	if err := client.Push(context.Background(), newJob(t, "slow")); err != nil {
+	if err := client.Push(context.Background(), newJob(t, "slow", nil)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -903,7 +904,7 @@ func TestW10HandlerThatIgnoresContextCannotBlockShutdown(t *testing.T) {
 	release := make(chan struct{})
 	returned := make(chan struct{})
 
-	worker.Register("stuck", func(context.Context, *Job) error {
+	worker.On("stuck", func(context.Context, *Job) error {
 		defer close(returned)
 
 		close(started)
@@ -914,7 +915,7 @@ func TestW10HandlerThatIgnoresContextCannotBlockShutdown(t *testing.T) {
 
 	cancel, done := runWorker(t, worker)
 
-	if err := client.Push(context.Background(), newJob(t, "stuck")); err != nil {
+	if err := client.Push(context.Background(), newJob(t, "stuck", nil)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -937,10 +938,10 @@ func TestW10HandlerThatIgnoresContextCannotBlockShutdown(t *testing.T) {
 
 const chatTopic = "chat.message"
 
-func subscribe(t *testing.T, client *Client, queue, jobType string) {
+func subscribe(t *testing.T, client *Client, queue, event string) {
 	t.Helper()
 
-	subscription := Subscription{Topic: chatTopic, Queue: queue, JobType: jobType}
+	subscription := Subscription{Topic: chatTopic, Queue: queue, Event: event}
 
 	if err := client.Subscribe(context.Background(), subscription); err != nil {
 		t.Fatal(err)
@@ -1002,8 +1003,8 @@ func TestT01PublishMakesOneJobForEachSubscription(t *testing.T) {
 
 	subscribers := map[string]string{"realtime": "chat.broadcast", "cassandra": "chat.store", "push": "chat.notify"}
 
-	for queue, jobType := range subscribers {
-		subscribe(t, client, queue, jobType)
+	for queue, event := range subscribers {
+		subscribe(t, client, queue, event)
 	}
 
 	options := PublishOptions{ID: "msg-42", Custom: map[string]any{"tenant": "acme"}}
@@ -1013,13 +1014,13 @@ func TestT01PublishMakesOneJobForEachSubscription(t *testing.T) {
 		t.Fatalf("unexpected result: %+v", published)
 	}
 
-	for queue, jobType := range subscribers {
+	for queue, event := range subscribers {
 		job, err := client.Fetch(ctx, queue)
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		if job == nil || job.Type != jobType || job.Queue != queue {
+		if job == nil || job.Type != event || job.Queue != queue {
 			t.Fatalf("unexpected job in %s: %+v", queue, job)
 		}
 
@@ -1107,7 +1108,7 @@ func TestT05WorkerSubscribesWhenItStarts(t *testing.T) {
 	worker := NewWorker(server.url(), WorkerOptions{Concurrency: 1})
 	log := &eventLog{counts: map[string]int{}}
 
-	worker.Subscribe(Subscription{Topic: chatTopic, Queue: "realtime", JobType: "chat.broadcast"}, log.handler("msg-"))
+	worker.On("chat.broadcast", log.handler("msg-"), Options{Queue: "realtime", Topics: []string{chatTopic}})
 	runWorker(t, worker)
 
 	waitSubscribed(t, client, 1)
@@ -1121,11 +1122,11 @@ func TestT06TwoWorkersRunOneCopyOfEachEvent(t *testing.T) {
 	client := open(t, server.url())
 	logs := map[string]*eventLog{}
 
-	for queue, jobType := range map[string]string{"cassandra": "chat.store", "push": "chat.notify"} {
+	for queue, event := range map[string]string{"cassandra": "chat.store", "push": "chat.notify"} {
 		worker := NewWorker(server.url(), WorkerOptions{Concurrency: 2})
 		logs[queue] = &eventLog{counts: map[string]int{}}
 
-		worker.Subscribe(Subscription{Topic: chatTopic, Queue: queue, JobType: jobType}, logs[queue].handler("msg-"))
+		worker.On(event, logs[queue].handler("msg-"), Options{Queue: queue, Topics: []string{chatTopic}})
 		runWorker(t, worker)
 	}
 
@@ -1145,5 +1146,226 @@ func TestT06TwoWorkersRunOneCopyOfEachEvent(t *testing.T) {
 				t.Fatalf("%s ran %s %d times", queue, event, count)
 			}
 		}
+	}
+}
+
+func TestI01ContractKeysGoToWireFields(t *testing.T) {
+	expiresAt := time.Date(2030, 1, 2, 3, 4, 5, 0, time.UTC)
+	runAt := time.Now().Add(time.Hour)
+
+	options := Options{
+		Queue:       "critical",
+		Retry:       Int(3),
+		ReserveFor:  2 * time.Minute,
+		Backtrace:   5,
+		At:          runAt,
+		UniqueFor:   time.Minute,
+		UniqueUntil: "success",
+		ExpiresIn:   time.Hour,
+		ExpiresAt:   expiresAt,
+		Track:       true,
+		OnDead:      &DeadHook{Event: "email.dead", Queue: "dead-letters"},
+		Custom:      map[string]any{"tenant": "acme", "track": 0, "unique_until": "start"},
+	}
+
+	job := newJob(t, "email.send", []any{"a@b.com"}, options)
+
+	encoded, err := json.Marshal(job)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var wire map[string]any
+
+	if err := json.Unmarshal(encoded, &wire); err != nil {
+		t.Fatal(err)
+	}
+
+	fields := map[string]any{
+		"jobtype":     "email.send",
+		"queue":       "critical",
+		"retry":       3.0,
+		"reserve_for": 120.0,
+		"backtrace":   5.0,
+		"at":          runAt.UTC().Format(time.RFC3339Nano),
+	}
+
+	for key, want := range fields {
+		if wire[key] != want {
+			t.Fatalf("wire field %s is %v, want %v", key, wire[key], want)
+		}
+	}
+
+	custom := map[string]any{
+		"unique_for":   60.0,
+		"unique_until": "success",
+		"expires_in":   3600.0,
+		"expires_at":   "2030-01-02T03:04:05Z",
+		"track":        1.0,
+		"on_dead":      map[string]any{"jobtype": "email.dead", "queue": "dead-letters"},
+		"tenant":       "acme",
+	}
+
+	if !reflect.DeepEqual(wire["custom"], custom) {
+		t.Fatalf("unexpected custom: %v", wire["custom"])
+	}
+
+	client := open(t, startServer(t).url())
+	ctx := context.Background()
+	pushed := newJob(t, "email.send", []any{"a@b.com"}, options, Options{At: time.Now().Add(-time.Second)})
+
+	if err := client.Push(ctx, pushed); err != nil {
+		t.Fatal(err)
+	}
+
+	fetched, err := client.Fetch(ctx, "critical")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if fetched == nil || fetched.Type != "email.send" {
+		t.Fatalf("unexpected job: %+v", fetched)
+	}
+
+	hook, _ := fetched.Custom["on_dead"].(map[string]any)
+
+	if hook["jobtype"] != "email.dead" || fetched.Custom["track"] != 1.0 || fetched.Custom["unique_for"] != 60.0 {
+		t.Fatalf("the server must keep the contract keys: %v", fetched.Custom)
+	}
+}
+
+func TestI02OptionSetsMergeInOrder(t *testing.T) {
+	first := Options{
+		Queue:      "low",
+		Retry:      Int(5),
+		ReserveFor: 2 * time.Minute,
+		Custom:     map[string]any{"a": 1, "b": 1},
+		Topics:     []string{"t1", "t2"},
+	}
+
+	second := Options{
+		Queue:  "high",
+		Retry:  Int(0),
+		Custom: map[string]any{"b": 2, "c": 2},
+		Topics: []string{"t2", "t3"},
+	}
+
+	job := newJob(t, "x", nil, first, second)
+
+	if job.Queue != "high" || job.Retry == nil || *job.Retry != 0 || job.ReserveFor != 120 {
+		t.Fatalf("a later single value must win, and an unset one must not: %+v", job)
+	}
+
+	if !reflect.DeepEqual(job.Custom, map[string]any{"a": 1, "b": 2, "c": 2}) {
+		t.Fatalf("unexpected custom: %v", job.Custom)
+	}
+
+	if !reflect.DeepEqual(first.Custom, map[string]any{"a": 1, "b": 1}) {
+		t.Fatalf("the merge must not change an option set: %v", first.Custom)
+	}
+
+	worker := NewWorker("", WorkerOptions{})
+
+	worker.On("x", func(context.Context, *Job) error { return nil }, first, second)
+
+	var topics []string
+
+	for _, subscription := range worker.subscriptions {
+		topics = append(topics, subscription.Topic)
+
+		if subscription.Retry == nil || *subscription.Retry != 0 {
+			t.Fatalf("the subscription must have the later retry: %+v", subscription)
+		}
+
+		want := Subscription{Topic: subscription.Topic, Queue: "high", Event: "x", Retry: subscription.Retry, ReserveFor: 120}
+
+		if subscription != want {
+			t.Fatalf("unexpected subscription: %+v", subscription)
+		}
+	}
+
+	if !slices.Equal(topics, []string{"t1", "t2", "t3"}) {
+		t.Fatalf("topics must add up in order, with no duplicates: %v", topics)
+	}
+}
+
+func TestI03SecondDeclarationForAnEventIsAnError(t *testing.T) {
+	worker := NewWorker("", WorkerOptions{})
+	handler := func(context.Context, *Job) error { return nil }
+
+	worker.On("email.send", handler)
+	worker.On("email.store", handler)
+
+	defer func() {
+		message, _ := recover().(string)
+
+		if !strings.Contains(message, `"email.send"`) {
+			t.Fatalf("a second On for an event must panic with the event: %q", message)
+		}
+	}()
+
+	worker.On("email.send", handler, Options{Queue: "other"})
+}
+
+func TestI04DeclarationWithTopicsSubscribesAndRunsCopies(t *testing.T) {
+	server := startServer(t)
+	client := open(t, server.url())
+	worker := NewWorker(server.url(), WorkerOptions{Concurrency: 1})
+	editTopic := "chat.edit"
+	copies := make(chan *Job, 2)
+
+	options := Options{
+		Queue:      "audit",
+		Retry:      Int(2),
+		ReserveFor: 90 * time.Second,
+		Topics:     []string{chatTopic, editTopic},
+	}
+
+	worker.On("chat.audit", func(_ context.Context, job *Job) error {
+		if event, _ := job.Custom["event"].(string); strings.HasPrefix(event, "msg-") {
+			copies <- job
+		}
+
+		return nil
+	}, options)
+
+	runWorker(t, worker)
+
+	for _, topic := range options.Topics {
+		waitFor(t, func() bool {
+			published, err := client.Publish(context.Background(), topic, nil, PublishOptions{})
+
+			return err == nil && published.Jobs == 1
+		})
+	}
+
+	for i, topic := range options.Topics {
+		publishOptions := PublishOptions{ID: fmt.Sprintf("msg-%d", i)}
+
+		if _, err := client.Publish(context.Background(), topic, []any{"hi"}, publishOptions); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	seen := map[string]bool{}
+
+	for range options.Topics {
+		var job *Job
+
+		select {
+		case job = <-copies:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("the worker ran only the copies of %v", seen)
+		}
+
+		if job.Type != "chat.audit" || job.Queue != "audit" || job.Retry == nil || *job.Retry != 2 || job.ReserveFor != 90 {
+			t.Fatalf("the copy must have the options of the declaration: %+v", job)
+		}
+
+		seen[job.Custom["topic"].(string)] = true
+	}
+
+	if !seen[chatTopic] || !seen[editTopic] {
+		t.Fatalf("the worker must run one copy of each topic: %v", seen)
 	}
 }

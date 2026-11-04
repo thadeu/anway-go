@@ -18,13 +18,13 @@ go get github.com/thadeu/anway-go
 ## Push
 
 ```go
-client, err := anway.Open("tcp://:password@localhost:7419", anway.Options{})
+client, err := anway.Open("tcp://:password@localhost:7419", anway.ClientOptions{})
 if err != nil {
 	return err
 }
 defer client.Close()
 
-job, err := anway.NewJob("email.send", "a@b.com", "Welcome")
+job, err := anway.NewJob("email.send", []any{"a@b.com", "Welcome"}, anway.Options{Queue: "critical", Retry: anway.Int(5)})
 if err != nil {
 	return err
 }
@@ -39,7 +39,7 @@ A blank URL uses `ANWAY_URL`. Use `tcp+tls://` for TLS. A client is safe for con
 ```go
 worker := anway.NewWorker("", anway.WorkerOptions{Queues: []string{"critical", "default"}})
 
-worker.Register("email.send", func(ctx context.Context, job *anway.Job) error {
+worker.On("email.send", func(ctx context.Context, job *anway.Job) error {
 	var address, subject string
 
 	if err := job.Bind(&address, &subject); err != nil {
@@ -54,6 +54,8 @@ return worker.Run(ctx)
 
 A handler error or panic fails the job, and the server retries it. Delivery is at least once, so handlers must be idempotent.
 
+A worker has one handler for each event. A second `On` for the same event panics, as a duplicate pattern does in `net/http`.
+
 ### Shutdown
 
 The worker stops at the server `terminate` command, or when its context ends. Server `quiet` stops fetching, and the worker stays alive.
@@ -63,6 +65,53 @@ The worker stops at the server `terminate` command, or when its context ends. Se
 3. The worker fails jobs that still run, and `Run` returns. A late result from these handlers is ignored.
 
 Handlers must respect `ctx`. A goroutine that ignores it continues to run after `Run` returns.
+
+## Options
+
+Since v0.4.0, `NewJob` and `Worker.On` take `anway.Options`, with the keys of the [input contract](https://github.com/thadeu/anway/blob/main/docs/dev/clients.md#input-contract). All Anway clients use the same keys. The client translates them to the fields of the protocol.
+
+```go
+job, err := anway.NewJob("report.build", []any{42}, anway.Options{
+	Queue:     "reports",
+	At:        time.Now().Add(time.Hour),
+	UniqueFor: 10 * time.Minute,
+	Track:     true,
+	OnDead:    &anway.DeadHook{Event: "report.failed"},
+	Custom:    map[string]any{"tenant": "acme"},
+})
+```
+
+| Field | Wire field | Note |
+|---|---|---|
+| `Queue` | `queue` | Default `default`. |
+| `Retry` | `retry` | Use `anway.Int(n)`. Default 25 (server). `0` discards at the first failure. `-1` goes to Dead at once. |
+| `ReserveFor` | `reserve_for` | Sent in whole seconds, rounded up. |
+| `Backtrace` | `backtrace` | Lines. |
+| `At` | `at` | For a push only. |
+| `UniqueFor` | `custom.unique_for` | Sent in seconds. |
+| `UniqueUntil` | `custom.unique_until` | `success` or `start`. |
+| `ExpiresIn` | `custom.expires_in` | Sent in seconds. |
+| `ExpiresAt` | `custom.expires_at` | RFC 3339. |
+| `Track` | `custom.track` | `true` sends `1`. |
+| `OnDead` | `custom.on_dead` | `DeadHook{Event, Queue}`. `Event` goes out as `jobtype`. |
+| `Custom` | `custom` | The keys of the app. The keys above win over a key with the same name. |
+| `Topics` | One `SUBSCRIBE` for each topic | For `On` only. |
+
+The event, which is the first argument of `NewJob` and `On`, goes out as `jobtype`.
+
+You can give more than one `Options` value. They merge in order:
+
+- A single value, such as `Queue` or `Retry`: the last value that is set wins.
+- `Topics` add up, in order, with no duplicates.
+- `Custom` maps merge, and a later key wins.
+
+```go
+defaults := anway.Options{Queue: "mail", Retry: anway.Int(3)}
+
+job, err := anway.NewJob("email.send", []any{"a@b.com"}, defaults, anway.Options{Retry: anway.Int(10)})
+```
+
+`On` uses only `Queue`, `Retry`, `ReserveFor`, and `Topics`. The other fields are for a push, and have no effect in `On`.
 
 ## Topics
 
@@ -79,39 +128,40 @@ if err != nil {
 // published.Jobs is 3: one job in each of the realtime, cassandra, and push queues.
 ```
 
-Each app declares its subscription in its worker, with its own queue and job type. In this short example, one worker has all three:
+Each app declares its subscription in its worker, with the `Topics` option, and its own event and queue. In this short example, one worker has all three:
 
 ```go
 worker := anway.NewWorker("", anway.WorkerOptions{})
-retries := 5
+topics := []string{"chat.message"}
 
-worker.Subscribe(anway.Subscription{Topic: "chat.message", Queue: "realtime", JobType: "chat.broadcast"}, broadcast)
-worker.Subscribe(anway.Subscription{Topic: "chat.message", Queue: "cassandra", JobType: "chat.store"}, store)
-worker.Subscribe(anway.Subscription{Topic: "chat.message", Queue: "push", JobType: "chat.notify", Retry: &retries}, notify)
+worker.On("chat.broadcast", broadcast, anway.Options{Queue: "realtime", Topics: topics})
+worker.On("chat.store", store, anway.Options{Queue: "cassandra", Topics: topics})
+worker.On("chat.notify", notify, anway.Options{Queue: "push", Retry: anway.Int(5), Topics: topics})
 
 return worker.Run(ctx)
 ```
 
-`Run` sends `SUBSCRIBE` for each subscription before its first fetch. The worker fetches from the queue of each subscription. Without `Queues`, it fetches only from these queues.
+`Run` sends `SUBSCRIBE` for each topic of each declaration before its first fetch, with the event as the job type, and the `Queue`, `Retry`, and `ReserveFor` of the declaration. When a declaration has topics or sets a queue, the worker fetches from that queue. Without `Queues` and without such a declaration, the worker fetches from `default`.
 
 - With an `ID`, a second event with the same topic and id within `UniqueFor` (one day) does nothing, and `Duplicate` is true. A zero `UniqueFor` turns this check off.
 - `Custom` goes to each copy. The server adds `topic` and `event` to it. Use `job.Custom["event"]` to make a handler idempotent.
 - An event with no subscription goes to the Dead set, and `Jobs` is 0.
-- `Retry` and `ReserveFor` in a `Subscription` set the options of each copy. `Worker.Subscribe` sends them at each start, so the worker code sets them. `client.Subscribe` and `client.Unsubscribe` change subscriptions from any app.
+- `Run` sends the subscriptions again at each start, so the worker code sets them. To send one topic to several flows, declare several events, each with the topic.
+- `client.Subscribe(ctx, anway.Subscription{Topic, Queue, Event, Retry, ReserveFor})` and `client.Unsubscribe(ctx, topic, queue, event)` change subscriptions from any app. `ReserveFor` in a `Subscription` is in seconds.
 
 ## Contract
 
 | Group | Operations |
 |---|---|
-| Jobs | `Push`, `Fetch`, `Ack`, `Fail`, `Beat` |
+| Jobs | `NewJob`, `Push`, `Fetch`, `Ack`, `Fail`, `Beat` |
 | Queues | `PauseQueues`, `ResumeQueues`, `RemoveQueues`, `QueueSizes`, `Info` |
 | Admin | `Mutate` |
 | Batches | `BatchNew`, `BatchOpen`, `BatchCommit`, `BatchStatus` |
 | Tracking | `TrackGet`, `TrackSet` |
 | Topics | `Publish`, `Subscribe`, `Unsubscribe` |
-| Worker | `Register`, `Subscribe`, `Use`, `Run` |
+| Worker | `On`, `Use`, `Run` |
 
-The error kinds are `ErrNotUnique`, `ErrClosed`, `ServerError`, and connection errors. A failed call does not resend, so the app decides whether to repeat it.
+The input keys of `NewJob` and `On` are in [Options](#options). The error kinds are `ErrNotUnique`, `ErrClosed`, `ServerError`, and connection errors. A failed call does not resend, so the app decides whether to repeat it.
 
 ## Tests
 

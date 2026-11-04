@@ -34,8 +34,10 @@ type Job struct {
 	Custom     map[string]any  `json:"custom,omitempty"`
 }
 
-// NewJob creates a job for the default queue with a generated id.
-func NewJob(jobType string, args ...any) (*Job, error) {
+// NewJob creates a job for an event, with a generated id. The event goes out
+// as the job type. The option sets merge in order, as Options describes. A
+// blank queue is "default". Topics has no effect on a push.
+func NewJob(event string, args []any, options ...Options) (*Job, error) {
 	if args == nil {
 		args = []any{}
 	}
@@ -50,7 +52,11 @@ func NewJob(jobType string, args ...any) (*Job, error) {
 		return nil, err
 	}
 
-	return &Job{JID: jid, Type: jobType, Args: encoded}, nil
+	job, _ := translate(event, options)
+	job.JID = jid
+	job.Args = encoded
+
+	return &job, nil
 }
 
 // Bind decodes the args in order into the given pointers.
@@ -76,7 +82,7 @@ func (j *Job) Bind(targets ...any) error {
 
 // RunAt schedules the job.
 func (j *Job) RunAt(at time.Time) *Job {
-	j.At = at.UTC().Format(time.RFC3339Nano)
+	j.At = formatTime(at)
 
 	return j
 }

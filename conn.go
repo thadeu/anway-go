@@ -33,7 +33,7 @@ type conn struct {
 	reader *bufio.Reader
 }
 
-func dial(ctx context.Context, target endpoint, options Options) (*conn, error) {
+func dial(ctx context.Context, target endpoint, options ClientOptions) (*conn, error) {
 	dialer := &net.Dialer{Timeout: options.Timeout}
 
 	raw, err := dialer.DialContext(ctx, "tcp", target.address)
@@ -71,7 +71,7 @@ func dial(ctx context.Context, target endpoint, options Options) (*conn, error) 
 	return current, nil
 }
 
-func (c *conn) handshake(target endpoint, options Options) error {
+func (c *conn) handshake(target endpoint, options ClientOptions) error {
 	greeting, err := c.read()
 	if err != nil {
 		return err
