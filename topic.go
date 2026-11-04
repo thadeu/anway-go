@@ -2,6 +2,7 @@ package anway
 
 import (
 	"context"
+	"fmt"
 	"time"
 )
 
@@ -48,10 +49,21 @@ type publishRequest struct {
 	Custom    map[string]any `json:"custom,omitempty"`
 }
 
-// Publish sends an event to every subscription of the topic, in one
-// transaction. An event with no subscription goes to the dead set, and the
-// result has 0 jobs.
-func (c *Client) Publish(ctx context.Context, topic string, args []any, options PublishOptions) (Published, error) {
+// Event is one event of PublishBulk: a topic, its args, and its options.
+type Event struct {
+	Topic   string
+	Args    []any
+	Options PublishOptions
+}
+
+// PublishResult is the result of one event of PublishBulk. Error is the
+// reason when the server refused the event, and is empty in other cases.
+type PublishResult struct {
+	Published
+	Error string `json:"error,omitempty"`
+}
+
+func newPublishRequest(topic string, args []any, options PublishOptions) publishRequest {
 	if args == nil {
 		args = []any{}
 	}
@@ -63,9 +75,41 @@ func (c *Client) Publish(ctx context.Context, topic string, args []any, options 
 		request.UniqueFor = &seconds
 	}
 
+	return request
+}
+
+// Publish sends an event to every subscription of the topic, in one
+// transaction. An event with no subscription goes to the dead set, and the
+// result has 0 jobs.
+func (c *Client) Publish(ctx context.Context, topic string, args []any, options PublishOptions) (Published, error) {
 	var published Published
 
-	return published, c.callJSON(ctx, "PUBLISH", request, &published)
+	return published, c.callJSON(ctx, "PUBLISH", newPublishRequest(topic, args, options), &published)
+}
+
+// PublishBulk sends up to MaxBulk events with one PUBLISHB, and the server
+// saves them in one write. Each event works as one Publish. It returns one
+// result for each event, in the same order. A refused event, such as a bad
+// topic, has Error, and does not stop the others. More than MaxBulk events
+// is an error, and nothing goes to the server.
+func (c *Client) PublishBulk(ctx context.Context, events []Event) ([]PublishResult, error) {
+	if len(events) > MaxBulk {
+		return nil, fmt.Errorf("anway: a bulk publish has at most %d events, not %d", MaxBulk, len(events))
+	}
+
+	if len(events) == 0 {
+		return []PublishResult{}, nil
+	}
+
+	requests := make([]publishRequest, len(events))
+
+	for index, event := range events {
+		requests[index] = newPublishRequest(event.Topic, event.Args, event.Options)
+	}
+
+	var results []PublishResult
+
+	return results, c.callJSON(ctx, "PUBLISHB", requests, &results)
 }
 
 // Subscribe saves a subscription on the server. It is idempotent: a second

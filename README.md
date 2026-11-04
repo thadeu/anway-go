@@ -183,6 +183,28 @@ if err != nil {
 // published.Jobs is 3: one job in each of the realtime, cassandra, and push queues.
 ```
 
+### Bulk publish
+
+`PublishBulk` sends up to 1,000 events (`anway.MaxBulk`) with one `PUBLISHB`. The server saves all copies in one write, so an import or an outbox relay is much faster than one `Publish` for each event. Use `Publish` for one event, such as in a request.
+
+```go
+results, err := client.PublishBulk(ctx, []anway.Event{
+	{Topic: "order.paid", Args: []any{order1}, Options: anway.PublishOptions{ID: "order-1"}},
+	{Topic: "order.paid", Args: []any{order2}, Options: anway.PublishOptions{ID: "order-2"}},
+})
+if err != nil {
+	return err
+}
+
+for _, result := range results {
+	if result.Error != "" {
+		log.Printf("event %s: %s", result.Event, result.Error)
+	}
+}
+```
+
+The results keep the order of the events. Each event works as one `Publish`, with the same dedup by id. A refused event, such as a bad topic, has `Error` and does not stop the others. A bulk can make at most 10,000 jobs over all subscriptions.
+
 Each app declares its subscription in its worker, with the `Topics` option, and its own event and queue. In this short example, one worker has all three:
 
 ```go
@@ -213,7 +235,7 @@ return worker.Run(ctx)
 | Admin | `Mutate` |
 | Batches | `BatchNew`, `BatchOpen`, `BatchCommit`, `BatchStatus` |
 | Tracking | `TrackGet`, `TrackSet` |
-| Topics | `Publish`, `Subscribe`, `Unsubscribe` |
+| Topics | `Publish`, `PublishBulk`, `Subscribe`, `Unsubscribe` |
 | Worker | `On`, `Use`, `Run` |
 
 The input keys of `NewJob` and `On` are in [Options](#options). The error kinds are `ErrNotUnique`, `ErrClosed`, `ServerError`, and connection errors. A failed call does not resend, so the app decides whether to repeat it.

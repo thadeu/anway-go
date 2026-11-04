@@ -1589,6 +1589,47 @@ func TestT05WorkerSubscribesWhenItStarts(t *testing.T) {
 	waitFor(t, func() bool { return log.snapshot()["msg-1"] == 1 })
 }
 
+func TestT07PublishBulk(t *testing.T) {
+	client := open(t, startServer(t).url())
+	ctx := context.Background()
+
+	subscribe(t, client, "realtime", "chat.broadcast")
+	subscribe(t, client, "cassandra", "chat.store")
+
+	results, err := client.PublishBulk(ctx, []Event{
+		{Topic: chatTopic, Args: []any{1}, Options: PublishOptions{ID: "bulk-1"}},
+		{Topic: chatTopic, Args: []any{2}},
+		{Topic: chatTopic, Args: []any{3}, Options: PublishOptions{ID: "bulk-1"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(results) != 3 || results[0].Event != "bulk-1" || results[0].Jobs != 2 || results[1].Jobs != 2 || results[1].Event == "" {
+		t.Fatalf("the first two events must make two jobs each, in order: %+v", results)
+	}
+
+	if !results[2].Duplicate || results[2].Jobs != 0 || results[2].Error != "" {
+		t.Fatalf("the third event repeats the first id, so it must be a duplicate: %+v", results[2])
+	}
+
+	sizes, err := client.QueueSizes(ctx)
+	if err != nil || sizes["realtime"] != 2 || sizes["cassandra"] != 2 {
+		t.Fatalf("four jobs must be in the two queues: %v %v", sizes, err)
+	}
+
+	refused, err := client.PublishBulk(ctx, []Event{{Topic: "bad topic", Args: []any{}}, {Topic: chatTopic}})
+	if err != nil || refused[0].Error == "" || refused[1].Jobs != 2 {
+		t.Fatalf("a refused event must have a reason, and not stop the others: %+v %v", refused, err)
+	}
+
+	tooMany := make([]Event, MaxBulk+1)
+
+	if _, err := client.PublishBulk(ctx, tooMany); err == nil || !strings.Contains(err.Error(), "at most 1000") {
+		t.Fatalf("more than MaxBulk events must be refused before the server: %v", err)
+	}
+}
+
 func TestT06TwoWorkersRunOneCopyOfEachEvent(t *testing.T) {
 	server := startServer(t)
 	client := open(t, server.url())
