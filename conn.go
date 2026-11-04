@@ -26,6 +26,12 @@ type hello struct {
 	WID      string   `json:"wid,omitempty"`
 	PID      int      `json:"pid,omitempty"`
 	Labels   []string `json:"labels,omitempty"`
+
+	Concurrency    int        `json:"concurrency,omitempty"`
+	Tag            string     `json:"tag,omitempty"`
+	Queues         []string   `json:"queues,omitempty"`
+	Autoscale      *Autoscale `json:"autoscale,omitempty"`
+	MaxConcurrency int        `json:"max_concurrency,omitempty"`
 }
 
 type conn struct {
@@ -102,6 +108,18 @@ func (c *conn) handshake(target endpoint, options ClientOptions) error {
 		request.Hostname, _ = os.Hostname()
 		request.PID = os.Getpid()
 		request.Labels = options.Labels
+	}
+
+	if worker := options.identity; worker != nil {
+		if worker.Hostname != "" {
+			request.Hostname = worker.Hostname
+		}
+
+		request.Concurrency = worker.Concurrency
+		request.Tag = worker.Tag
+		request.Queues = worker.Queues
+		request.Autoscale = worker.Autoscale
+		request.MaxConcurrency = worker.MaxConcurrency
 	}
 
 	_, err = c.command("HELLO", request)

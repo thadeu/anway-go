@@ -34,6 +34,25 @@ return client.Push(ctx, job)
 
 A blank URL uses `ANWAY_URL`. Use `tcp+tls://` for TLS. A client is safe for concurrent use.
 
+### Bulk push
+
+`PushBulk` sends up to 1,000 jobs (`anway.MaxBulk`) with one `PUSHB`. The server saves them in one write.
+
+```go
+failures, err := client.PushBulk(ctx, jobs)
+if err != nil {
+	return err
+}
+
+for jid, reason := range failures {
+	log.Printf("job %s is not in: %s", jid, reason)
+}
+```
+
+- `failures` holds the reason for each job that is not in, by jid, such as a duplicate jid or a unique lock. It is empty when all jobs are in.
+- A refused job does not stop the others.
+- More than 1,000 jobs is an error, and no job goes to the server. Send more jobs in parts of 1,000 or less.
+
 ## Worker
 
 ```go
@@ -65,6 +84,42 @@ The worker stops at the server `terminate` command, or when its context ends. Se
 3. The worker fails jobs that still run, and `Run` returns. A late result from these handlers is ignored.
 
 Handlers must respect `ctx`. A goroutine that ignores it continues to run after `Run` returns.
+
+### Threads and autoscale
+
+A worker runs `Concurrency` jobs at once (default 10), each in its own goroutine. The web UI calls them threads. The server can change this count while the worker runs: from the web UI, from the HTTP API, or with autoscale. See [worker threads](https://github.com/thadeu/anway/blob/main/docs/dev/worker-threads.md).
+
+```go
+worker := anway.NewWorker("", anway.WorkerOptions{
+	Queues:         []string{"critical", "default"},
+	Concurrency:    10,
+	MaxConcurrency: 25,
+	Autoscale:      &anway.Autoscale{Max: 40},
+	Hostname:       "worker.1",
+	Tag:            "shop",
+})
+```
+
+| Field | Default | Note |
+|---|---|---|
+| `Concurrency` | 10 | The jobs that the worker runs at once when it starts. |
+| `MaxConcurrency` | 0 (no limit) | The most jobs that the worker can run at once, such as the size of its database pool. The worker never runs more, and the server never asks for more. |
+| `Autoscale` | nil (off) | `&anway.Autoscale{Min, Max}` starts the worker with autoscale on. A zero `Min` is `Concurrency`. The server lowers a `Max` above `MaxConcurrency` to it. |
+| `Hostname` | The machine name | The web UI shows the worker by hostname and tag. |
+| `Tag` | None | A short name for the app or the role of the process, such as `shop`. |
+
+How the worker obeys the server:
+
+- Each `BEAT` sends the count that runs now, also the first `BEAT` at start. `HELLO` sends the hostname, pid, `Concurrency`, queues, tag, autoscale, and `MaxConcurrency`. A field that is not set is not sent.
+- When the server asks for more threads, the worker starts goroutines at once. When it asks for fewer, goroutines stop after their job. The worker never stops a running job to scale down.
+- A stop that is still pending is canceled first when the server asks for more threads again.
+- The connection pool grows with the count. It does not shrink.
+- After a change, the worker sends a `BEAT` with the new count at once, not at the next interval.
+- After `quiet`, the worker does not change its threads.
+
+The server saves a change for the worker name: hostname and tag. A new process with that name starts with the saved setting, not with its config. Set a stable `Hostname` in containers, so the setting stays across deploys.
+
+Each goroutine can hold a database connection. Set `MaxConcurrency` to the pool size, or set `Autoscale.Max` at or below it. Otherwise jobs can fail with a pool timeout.
 
 ## Options
 
@@ -153,7 +208,7 @@ return worker.Run(ctx)
 
 | Group | Operations |
 |---|---|
-| Jobs | `NewJob`, `Push`, `Fetch`, `Ack`, `Fail`, `Beat` |
+| Jobs | `NewJob`, `Push`, `PushBulk`, `Fetch`, `Ack`, `Fail`, `Beat`, `Heartbeat` |
 | Queues | `PauseQueues`, `ResumeQueues`, `RemoveQueues`, `QueueSizes`, `Info` |
 | Admin | `Mutate` |
 | Batches | `BatchNew`, `BatchOpen`, `BatchCommit`, `BatchStatus` |

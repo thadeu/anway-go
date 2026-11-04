@@ -28,6 +28,19 @@ type ClientOptions struct {
 	TLS      *tls.Config
 	WID      string
 	Labels   []string
+
+	identity *identity
+}
+
+// identity holds the HELLO fields that only a worker sends. A zero field is
+// not sent. A blank Hostname is the machine name.
+type identity struct {
+	Hostname       string
+	Tag            string
+	Queues         []string
+	Concurrency    int
+	Autoscale      *Autoscale
+	MaxConcurrency int
 }
 
 type endpoint struct {
@@ -36,6 +49,9 @@ type endpoint struct {
 	tls      bool
 }
 
+// MaxBulk is the most jobs that one PushBulk can send.
+const MaxBulk = 1000
+
 // Client talks to the server. It is safe for concurrent use.
 type Client struct {
 	target  endpoint
@@ -43,11 +59,20 @@ type Client struct {
 	slots   chan *conn
 	closed  chan struct{}
 	once    sync.Once
+
+	mu   sync.Mutex
+	size int
 }
 
 // Open creates a client. A blank URL uses ANWAY_URL, then the local default.
 // The connections open at first use.
 func Open(serverURL string, options ClientOptions) (*Client, error) {
+	return openClient(serverURL, options, 0)
+}
+
+// openClient creates a client whose pool can grow to capacity connections.
+// A capacity below the pool size is the pool size.
+func openClient(serverURL string, options ClientOptions, capacity int) (*Client, error) {
 	if serverURL == "" {
 		serverURL = os.Getenv("ANWAY_URL")
 	}
@@ -72,15 +97,31 @@ func Open(serverURL string, options ClientOptions) (*Client, error) {
 	client := &Client{
 		target:  target,
 		options: options,
-		slots:   make(chan *conn, options.PoolSize),
+		slots:   make(chan *conn, max(capacity, options.PoolSize)),
 		closed:  make(chan struct{}),
 	}
 
-	for range options.PoolSize {
-		client.slots <- nil
-	}
+	client.grow(options.PoolSize)
 
 	return client, nil
+}
+
+// grow lets the pool hold size connections at once, up to its capacity. The
+// pool does not shrink. An idle connection stays open until Close.
+func (c *Client) grow(size int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	select {
+	case <-c.closed:
+		return
+	default:
+	}
+
+	for c.size < min(size, cap(c.slots)) {
+		c.slots <- nil
+		c.size++
+	}
 }
 
 func parseURL(raw string) (endpoint, error) {
@@ -103,7 +144,11 @@ func (c *Client) Close() error {
 	c.once.Do(func() {
 		close(c.closed)
 
-		for range c.options.PoolSize {
+		c.mu.Lock()
+		size := c.size
+		c.mu.Unlock()
+
+		for range size {
 			if current := <-c.slots; current != nil {
 				current.close()
 			}
@@ -183,6 +228,25 @@ func (c *Client) Push(ctx context.Context, job *Job) error {
 	return err
 }
 
+// PushBulk sends up to MaxBulk jobs with one PUSHB, and the server saves
+// them in one write. It returns the reason for each job that is not in, by
+// jid, such as a duplicate jid or a unique lock. The map is empty when all
+// jobs are in. A refused job does not stop the others. More than MaxBulk
+// jobs is an error, and nothing goes to the server.
+func (c *Client) PushBulk(ctx context.Context, jobs []*Job) (map[string]string, error) {
+	if len(jobs) > MaxBulk {
+		return nil, fmt.Errorf("anway: a bulk push has at most %d jobs, not %d", MaxBulk, len(jobs))
+	}
+
+	failures := map[string]string{}
+
+	if len(jobs) == 0 {
+		return failures, nil
+	}
+
+	return failures, c.callJSON(ctx, "PUSHB", jobs, &failures)
+}
+
 // Fetch returns the next job, or nil when no job arrives in about 2 seconds.
 // The client needs a WID.
 func (c *Client) Fetch(ctx context.Context, queues ...string) (*Job, error) {
@@ -217,26 +281,41 @@ func (c *Client) Fail(ctx context.Context, jid, errType, message string, backtra
 
 // Beat reports liveness. It returns "", "quiet", or "terminate".
 func (c *Client) Beat(ctx context.Context, currentState string) (string, error) {
-	request := map[string]string{"wid": c.options.WID}
+	reply, err := c.Heartbeat(ctx, currentState, 0)
+
+	return reply.State, err
+}
+
+// Heartbeat is the reply to a BEAT. State is "", "quiet", or "terminate".
+// Concurrency is the thread count that the server wants, or 0 for no change.
+// A reply can have both.
+type Heartbeat struct {
+	State       string `json:"state"`
+	Concurrency int    `json:"concurrency"`
+}
+
+// Heartbeat reports liveness and the threads that the worker runs now. A
+// concurrency of 0 does not send the count, and the server then never asks
+// for a change.
+func (c *Client) Heartbeat(ctx context.Context, currentState string, concurrency int) (Heartbeat, error) {
+	request := map[string]any{"wid": c.options.WID}
 
 	if currentState != "" {
 		request["current_state"] = currentState
 	}
 
+	if concurrency > 0 {
+		request["concurrency"] = concurrency
+	}
+
+	var decoded Heartbeat
+
 	reply, err := c.call(ctx, "BEAT", request, 0)
 	if err != nil || reply == "OK" {
-		return "", err
+		return decoded, err
 	}
 
-	var decoded struct {
-		State string `json:"state"`
-	}
-
-	if err := json.Unmarshal([]byte(reply), &decoded); err != nil {
-		return "", err
-	}
-
-	return decoded.State, nil
+	return decoded, json.Unmarshal([]byte(reply), &decoded)
 }
 
 // Info returns server data.
